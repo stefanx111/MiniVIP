@@ -28,6 +28,12 @@
 #include "sdk/CCSPlayer_ItemServices.h"
 #include "sdk/CSmokeGrenadeProjectile.h"
 #include <map>
+#include <mysql/mysql.h> 
+
+const char* mysql_server = "host:port";
+const char* mysql_user = "dbname";
+const char* mysql_password = "password";
+const char* mysql_database = "dbname";
 
 MiniVIP g_MiniVIP;
 PLUGIN_EXPOSE(MiniVIP, g_MiniVIP);
@@ -43,6 +49,7 @@ CRoundPreStartEvent g_RoundPreStartEvent;
 CEntityListener g_EntityListener;
 bool g_bPistolRound;
 std::map<uint32, VipPlayer> g_VipPlayers;
+MYSQL* mysql = nullptr;
 
 class GameSessionConfiguration_t { };
 SH_DECL_HOOK3_void(INetworkServerService, StartupServer, SH_NOATTRIB, 0, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*);
@@ -50,110 +57,133 @@ SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
 
 bool MiniVIP::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
 {
-	PLUGIN_SAVEVARS();
+    PLUGIN_SAVEVARS();
 
-	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetEngineFactory, g_pCVar, ICvar, CVAR_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetEngineFactory, g_pGameResourceService, IGameResourceServiceServer, GAMERESOURCESERVICESERVER_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetFileSystemFactory, g_pFullFileSystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetEngineFactory, g_pCVar, ICvar, CVAR_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetEngineFactory, g_pGameResourceService, IGameResourceServiceServer, GAMERESOURCESERVICESERVER_INTERFACE_VERSION);
+    GET_V_IFACE_CURRENT(GetFileSystemFactory, g_pFullFileSystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 
-	// Get CSchemaSystem
-	{
-		HINSTANCE m_hModule = dlmount(WIN_LINUX("schemasystem.dll", "libschemasystem.so"));
-		g_pCSchemaSystem = reinterpret_cast<CSchemaSystem*>(reinterpret_cast<CreateInterfaceFn>(dlsym(m_hModule, "CreateInterface"))(SCHEMASYSTEM_INTERFACE_VERSION, nullptr));
-		dlclose(m_hModule);
-	}
+    {
+        HINSTANCE m_hModule = dlmount(WIN_LINUX("schemasystem.dll", "libschemasystem.so"));
+        g_pCSchemaSystem = reinterpret_cast<CSchemaSystem*>(reinterpret_cast<CreateInterfaceFn>(dlsym(m_hModule, "CreateInterface"))(SCHEMASYSTEM_INTERFACE_VERSION, nullptr));
+        dlclose(m_hModule);
+    }
 
-	if (!g_MiniVIP.LoadVips(error, maxlen))
-	{
-		ConColorMsg(Color(255, 0, 0, 255), "[%s] %s\n", GetLogTag(), error);
-		
+    if (!g_MiniVIP.LoadVips(error, maxlen))
+    {
+        ConColorMsg(Color(255, 0, 0, 255), "[%s] %s\n", GetLogTag(), error);
+
+        return false;
+    }
+
+	mysql = mysql_init(nullptr);
+	if (mysql_real_connect(mysql, mysql_server, mysql_user, mysql_password, mysql_database, 0, nullptr, 0) == nullptr) {
+		ConColorMsg(Color(255, 0, 0, 255), "[%s] Failed to connect to MySQL: %s\n", GetLogTag(), mysql_error(mysql));
 		return false;
 	}
+	const char* createTableQuery = "CREATE TABLE IF NOT EXISTS vip_players ("
+		"account_id INT NOT NULL PRIMARY KEY, "
+		"health INT, "
+		"armor INT, "
+		"gravity FLOAT, "
+		"money_min INT, "
+		"money_add INT, "
+		"defuser BOOL, "
+		"items TEXT, "
+		"smoke_color VARCHAR(255)"
+		")";
 
-	SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MiniVIP::StartupServer), true);
-	SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MiniVIP::GameFrame), true);
+	if (mysql_query(mysql, createTableQuery) != 0) {
+		ConColorMsg(Color(255, 0, 0, 255), "[%s] Failed to create table: %s\n", GetLogTag(), mysql_error(mysql));
+		return false;
+	}
+    SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MiniVIP::StartupServer), true);
+    SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MiniVIP::GameFrame), true);
 
-	gameeventmanager = static_cast<IGameEventManager2*>(CallVFunc<IToolGameEventAPI*, 91>(g_pSource2Server));
+    gameeventmanager = static_cast<IGameEventManager2*>(CallVFunc<IToolGameEventAPI*, 91>(g_pSource2Server));
 
-	ConVar_Register(FCVAR_GAMEDLL);
+    ConVar_Register(FCVAR_GAMEDLL);
 
-	return true;
+    return true;
 }
 
 bool MiniVIP::Unload(char *error, size_t maxlen)
 {
-	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MiniVIP::GameFrame), true);
-	SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MiniVIP::StartupServer), true);
+    SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MiniVIP::GameFrame), true);
+    SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MiniVIP::StartupServer), true);
 
-	gameeventmanager->RemoveListener(&g_PlayerSpawnEvent);
-	gameeventmanager->RemoveListener(&g_RoundPreStartEvent);
+    gameeventmanager->RemoveListener(&g_PlayerSpawnEvent);
+    gameeventmanager->RemoveListener(&g_RoundPreStartEvent);
 
-	g_pGameEntitySystem->RemoveListenerEntity(&g_EntityListener);
+    g_pGameEntitySystem->RemoveListenerEntity(&g_EntityListener);
 
-	ConVar_Unregister();
-	
-	return true;
+    ConVar_Unregister();
+
+    if (mysql != nullptr) {
+        mysql_close(mysql);
+    }
+
+    return true;
 }
 
 bool MiniVIP::LoadVips(char* error, size_t maxlen)
 {
-	KeyValues* pKVConfig = new KeyValues("MiniVIP");
-	KeyValues::AutoDelete autoDelete(pKVConfig);
-	
-	if (!pKVConfig->LoadFromFile(g_pFullFileSystem, "addons/mini_vip/mini_vip.ini"))
-	{
-		V_strncpy(error, "Failed to load vip config 'addons/mini_vip/mini_vip.ini'", maxlen);
-		return false;
-	}
+    const char* query = "SELECT * FROM vip_players";
+    
+    if (mysql_query(mysql, query) != 0) {
+        snprintf(error, maxlen, "MySQL query failed: %s", mysql_error(mysql));
+        return false;
+    }
 
-	for (KeyValues* pKey = pKVConfig->GetFirstSubKey(); pKey; pKey = pKey->GetNextKey())
-	{
-		uint32 accontId = V_StringToUint32(pKey->GetName(), 0);
-		if (accontId == 0)
-		{
-			Warning("[%s] accontid is 0\n", GetLogTag());
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (!result) {
+        snprintf(error, maxlen, "MySQL store result failed: %s", mysql_error(mysql));
+        return false;
+    }
 
-			continue;
-		}
+    while (MYSQL_ROW row = mysql_fetch_row(result)) {
+        uint32 accontId = atoi(row[0]);
+        if (accontId == 0) {
+            Warning("[%s] accontid is 0\n", GetLogTag());
+            continue;
+        }
 
-		VipPlayer& player = g_VipPlayers[accontId];
-		player.m_iHealth = pKey->GetInt("health", -1);
-		player.m_iArmor = pKey->GetInt("armor", -1);
-		player.m_fGravity = pKey->GetFloat("gravity", 1.f);
-		player.m_iMoneyMin = pKey->GetInt("money_min", -1);
-		player.m_iMoneyAdd = pKey->GetInt("money_add", -1);
-		player.m_bDefuser = pKey->GetBool("defuser", false);
-		if (const char* pszItems = pKey->GetString("items"))
-		{
-			V_SplitString(pszItems, " ", player.m_items);
-		}
-		if (!pKey->IsEmpty("smoke_color"))
-		{
-			player.m_vSmokeColor = new Vector();
-			
-			const char* pszSmokeColor = pKey->GetString("smoke_color");
-			if (strcmp(pszSmokeColor, "random") == 0)
-			{
-				player.m_vSmokeColor->Invalidate();
-			}
-			else
-			{
-				Vector& vSmokeColor = *player.m_vSmokeColor;
-				if (sscanf(pszSmokeColor, "%f %f %f", &vSmokeColor.x, &vSmokeColor.y, &vSmokeColor.z) != 3)
-				{
-					Warning("[%s] %u incorrect smoke_color value is specified (%s), must be r g b or random\n", GetLogTag(), accontId, pszSmokeColor);
+        VipPlayer& player = g_VipPlayers[accontId];
+        player.m_iHealth = atoi(row[1]);
+        player.m_iArmor = atoi(row[2]);
+        player.m_fGravity = atof(row[3]);
+        player.m_iMoneyMin = atoi(row[4]);
+        player.m_iMoneyAdd = atoi(row[5]);
+        player.m_bDefuser = (atoi(row[6]) != 0);
 
-					delete player.m_vSmokeColor;
-				}
-			}
-		}
-	}
+        const char* pszItems = row[7];
+        if (pszItems) {
+            V_SplitString(pszItems, " ", player.m_items);
+        }
 
-	return true;
+        const char* pszSmokeColor = row[8];
+        if (pszSmokeColor) {
+            player.m_vSmokeColor = new Vector();
+            if (strcmp(pszSmokeColor, "random") == 0) {
+                player.m_vSmokeColor->Invalidate();
+            } else {
+                Vector& vSmokeColor = *player.m_vSmokeColor;
+                if (sscanf(pszSmokeColor, "%f %f %f", &vSmokeColor.x, &vSmokeColor.y, &vSmokeColor.z) != 3) {
+                    Warning("[%s] %u incorrect smoke_color value is specified (%s), must be r g b or random\n", GetLogTag(), accontId, pszSmokeColor);
+                    delete player.m_vSmokeColor;
+                }
+            }
+        }
+    }
+
+    mysql_free_result(result);
+
+    return true;
 }
+
 
 void MiniVIP::NextFrame(std::function<void()> fn)
 {
@@ -203,7 +233,7 @@ void CPlayerSpawnEvent::FireGameEvent(IGameEvent* event)
 		return;
 	
 	CBasePlayerController* pPlayerController = static_cast<CBasePlayerController*>(event->GetPlayerController("userid"));
-	if (!pPlayerController || pPlayerController->m_steamID() == 0) // Ignore bots
+	if (!pPlayerController || pPlayerController->m_steamID() == 0) 
 		return;
 
 	g_MiniVIP.NextFrame([hPlayerController = CHandle<CBasePlayerController>(pPlayerController)]()
